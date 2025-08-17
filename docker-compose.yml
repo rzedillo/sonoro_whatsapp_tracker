@@ -1,0 +1,146 @@
+# docker-compose.yml - Complete local development environment
+version: '3.8'
+
+services:
+  # Backend API and Agent Orchestration
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: whatsapp-tracker-backend
+    ports:
+      - "${WHATSAPP_TRACKER_BACKEND_PORT:-8000}:8000"
+    environment:
+      - WHATSAPP_TRACKER_ENV=development
+      - WHATSAPP_TRACKER_DATABASE_HOST=database
+      - WHATSAPP_TRACKER_DATABASE_PORT=5432
+      - WHATSAPP_TRACKER_DATABASE_NAME=${WHATSAPP_TRACKER_DATABASE_NAME:-whatsapp_tracker_dev}
+      - WHATSAPP_TRACKER_DATABASE_USER=${WHATSAPP_TRACKER_DATABASE_USER:-whatsapp_user}
+      - WHATSAPP_TRACKER_DATABASE_PASSWORD=${WHATSAPP_TRACKER_DATABASE_PASSWORD:-dev_password}
+      - WHATSAPP_TRACKER_REDIS_URL=redis://redis:6379/0
+      - WHATSAPP_TRACKER_ANTHROPIC_API_KEY=${WHATSAPP_TRACKER_ANTHROPIC_API_KEY}
+      - WHATSAPP_TRACKER_LOG_LEVEL=DEBUG
+    env_file:
+      - .env.local
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - database
+      - redis
+    networks:
+      - whatsapp-tracker-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend Web Interface
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: whatsapp-tracker-frontend
+    ports:
+      - "${WHATSAPP_TRACKER_FRONTEND_PORT:-8501}:8501"
+    environment:
+      - WHATSAPP_TRACKER_BACKEND_HOST=backend
+      - WHATSAPP_TRACKER_BACKEND_PORT=8000
+      - WHATSAPP_TRACKER_ENV=development
+    env_file:
+      - .env.local
+    volumes:
+      - ./web:/app
+    depends_on:
+      - backend
+    networks:
+      - whatsapp-tracker-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL Database
+  database:
+    image: postgres:15-alpine
+    container_name: whatsapp-tracker-database
+    ports:
+      - "${WHATSAPP_TRACKER_DATABASE_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_DB=${WHATSAPP_TRACKER_DATABASE_NAME:-whatsapp_tracker_dev}
+      - POSTGRES_USER=${WHATSAPP_TRACKER_DATABASE_USER:-whatsapp_user}
+      - POSTGRES_PASSWORD=${WHATSAPP_TRACKER_DATABASE_PASSWORD:-dev_password}
+      - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+      - ./database/schemas:/schemas
+    networks:
+      - whatsapp-tracker-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${WHATSAPP_TRACKER_DATABASE_USER:-whatsapp_user} -d ${WHATSAPP_TRACKER_DATABASE_NAME:-whatsapp_tracker_dev}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis for Caching and Session Management
+  redis:
+    image: redis:7-alpine
+    container_name: whatsapp-tracker-redis
+    ports:
+      - "${WHATSAPP_TRACKER_REDIS_PORT:-6379}:6379"
+    environment:
+      - REDIS_PASSWORD=${WHATSAPP_TRACKER_REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+      - ./infrastructure/redis.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      - whatsapp-tracker-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    command: redis-server /usr/local/etc/redis/redis.conf
+
+  # Database Administration (Optional)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: whatsapp-tracker-pgadmin
+    ports:
+      - "8080:80"
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@whatsapptracker.local
+      - PGADMIN_DEFAULT_PASSWORD=admin
+      - PGADMIN_CONFIG_SERVER_MODE=False
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - database
+    networks:
+      - whatsapp-tracker-network
+    restart: unless-stopped
+    profiles:
+      - admin  # Only start with --profile admin
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+networks:
+  whatsapp-tracker-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

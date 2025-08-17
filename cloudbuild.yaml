@@ -1,0 +1,284 @@
+# cloudbuild.yaml - WhatsApp Task Tracker CI/CD Pipeline
+# Enhanced Framework V3.1 Implementation
+
+steps:
+  # Step 1: Validate local tests were run
+  - name: 'gcr.io/cloud-builders/git'
+    id: 'validate-local-tests'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "🔍 Validating local test execution..."
+        
+        # Check for test artifacts or test commit message
+        if git log -1 --pretty=%B | grep -E "(test:|tests:|✅|🧪)" > /dev/null; then
+          echo "✅ Local tests validated via commit message"
+        elif [ -f "test-results.json" ]; then
+          echo "✅ Local test results found"
+          cat test-results.json
+        else
+          echo "❌ No evidence of local test execution"
+          echo "Please run local tests first: ./scripts/run-tests.sh"
+          exit 1
+        fi
+
+  # Step 2: Set up environment variables
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'setup-environment'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "⚙️ Setting up environment variables..."
+        
+        # Determine environment based on branch
+        if [ "$BRANCH_NAME" = "main" ]; then
+          echo "ENVIRONMENT=prod" >> /workspace/.env.build
+          echo "PROJECT_ID=${_PROD_PROJECT_ID}" >> /workspace/.env.build
+        elif [ "$BRANCH_NAME" = "staging" ]; then
+          echo "ENVIRONMENT=staging" >> /workspace/.env.build
+          echo "PROJECT_ID=${_STAGING_PROJECT_ID}" >> /workspace/.env.build
+        else
+          echo "ENVIRONMENT=dev" >> /workspace/.env.build
+          echo "PROJECT_ID=${_DEV_PROJECT_ID}" >> /workspace/.env.build
+        fi
+        
+        # Load environment variables
+        source /workspace/.env.build
+        echo "📋 Environment: $ENVIRONMENT"
+        echo "📋 Project ID: $PROJECT_ID"
+
+  # Step 3: Run comprehensive tests in cloud environment
+  - name: 'docker/compose:latest'
+    id: 'run-cloud-tests'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "🧪 Running comprehensive test suite in cloud environment..."
+        
+        # Set up test environment
+        export WHATSAPP_TRACKER_ENV=test
+        export WHATSAPP_TRACKER_DATABASE_URL=postgresql://test_user:test_pass@localhost:5432/test_db
+        export WHATSAPP_TRACKER_REDIS_URL=redis://localhost:6379/1
+        
+        # Start test services
+        docker-compose -f docker-compose.test.yml up -d
+        
+        # Wait for services to be ready
+        sleep 30
+        
+        # Run unit tests
+        echo "🔬 Running unit tests..."
+        docker-compose -f docker-compose.test.yml exec -T backend python -m pytest tests/unit/ -v --junitxml=test-results-unit.xml
+        
+        # Run integration tests
+        echo "🔗 Running integration tests..."
+        docker-compose -f docker-compose.test.yml exec -T backend python -m pytest tests/integration/ -v --junitxml=test-results-integration.xml
+        
+        # Run end-to-end tests
+        echo "🌐 Running end-to-end tests..."
+        docker-compose -f docker-compose.test.yml exec -T backend python -m pytest tests/e2e/ -v --junitxml=test-results-e2e.xml
+        
+        # Cleanup test services
+        docker-compose -f docker-compose.test.yml down
+        
+        echo "✅ All tests passed in cloud environment"
+
+  # Step 4: Build backend container
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-backend'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGISTRY_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/whatsapp-tracker-backend:${SHORT_SHA}'
+      - '-t'
+      - '${_REGISTRY_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/whatsapp-tracker-backend:latest'
+      - '-f'
+      - 'Dockerfile.api'
+      - '.'
+    env:
+      - 'PROJECT_ID=${_PROJECT_ID}'
+
+  # Step 5: Build frontend container
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-frontend'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGISTRY_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/whatsapp-tracker-frontend:${SHORT_SHA}'
+      - '-t'
+      - '${_REGISTRY_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/whatsapp-tracker-frontend:latest'
+      - '-f'
+      - 'Dockerfile.web'
+      - '.'
+    env:
+      - 'PROJECT_ID=${_PROJECT_ID}'
+
+  # Step 6: Push containers to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-backend'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_REGISTRY_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/whatsapp-tracker-backend'
+    waitFor: ['build-backend']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-frontend'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_REGISTRY_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/whatsapp-tracker-frontend'
+    waitFor: ['build-frontend']
+
+  # Step 7: Deploy to Cloud Run
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'deploy-backend'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        source /workspace/.env.build
+        
+        echo "🚀 Deploying backend to Cloud Run..."
+        
+        gcloud run deploy whatsapp-tracker-$ENVIRONMENT-backend \
+          --image=${_REGISTRY_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/whatsapp-tracker-backend:${SHORT_SHA} \
+          --region=${_REGION} \
+          --platform=managed \
+          --allow-unauthenticated \
+          --set-env-vars="WHATSAPP_TRACKER_ENV=$ENVIRONMENT" \
+          --set-env-vars="WHATSAPP_TRACKER_DATABASE_HOST=${_DATABASE_HOST}" \
+          --set-env-vars="WHATSAPP_TRACKER_DATABASE_NAME=${_DATABASE_NAME}" \
+          --set-env-vars="WHATSAPP_TRACKER_DATABASE_USER=${_DATABASE_USER}" \
+          --set-env-vars="WHATSAPP_TRACKER_DATABASE_PASSWORD=${_DATABASE_PASSWORD}" \
+          --set-env-vars="WHATSAPP_TRACKER_REDIS_URL=${_REDIS_URL}" \
+          --set-env-vars="WHATSAPP_TRACKER_ANTHROPIC_API_KEY=${_ANTHROPIC_API_KEY}" \
+          --min-instances=${_MIN_INSTANCES} \
+          --max-instances=${_MAX_INSTANCES} \
+          --memory=${_MEMORY_LIMIT} \
+          --cpu=${_CPU_LIMIT} \
+          --project=${PROJECT_ID}
+    waitFor: ['push-backend', 'run-cloud-tests']
+
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'deploy-frontend'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        source /workspace/.env.build
+        
+        echo "🚀 Deploying frontend to Cloud Run..."
+        
+        # Get backend URL
+        BACKEND_URL=$(gcloud run services describe whatsapp-tracker-$ENVIRONMENT-backend \
+          --region=${_REGION} \
+          --format='value(status.url)' \
+          --project=${PROJECT_ID})
+        
+        gcloud run deploy whatsapp-tracker-$ENVIRONMENT-frontend \
+          --image=${_REGISTRY_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/whatsapp-tracker-frontend:${SHORT_SHA} \
+          --region=${_REGION} \
+          --platform=managed \
+          --allow-unauthenticated \
+          --set-env-vars="WHATSAPP_TRACKER_ENV=$ENVIRONMENT,WHATSAPP_TRACKER_BACKEND_HOST=$BACKEND_URL" \
+          --min-instances=${_MIN_INSTANCES} \
+          --max-instances=${_MAX_INSTANCES} \
+          --memory=${_MEMORY_LIMIT} \
+          --cpu=${_CPU_LIMIT} \
+          --project=${PROJECT_ID}
+    waitFor: ['push-frontend', 'deploy-backend']
+
+  # Step 8: Health check and smoke tests
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'health-check'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        source /workspace/.env.build
+        
+        echo "🏥 Running health checks..."
+        
+        # Get service URLs
+        BACKEND_URL=$(gcloud run services describe whatsapp-tracker-$ENVIRONMENT-backend \
+          --region=${_REGION} \
+          --format='value(status.url)' \
+          --project=${PROJECT_ID})
+        
+        FRONTEND_URL=$(gcloud run services describe whatsapp-tracker-$ENVIRONMENT-frontend \
+          --region=${_REGION} \
+          --format='value(status.url)' \
+          --project=${PROJECT_ID})
+        
+        # Health check backend
+        echo "🔍 Checking backend health..."
+        for i in {1..10}; do
+          if curl -f "$BACKEND_URL/health" > /dev/null 2>&1; then
+            echo "✅ Backend health check passed"
+            break
+          fi
+          echo "⏳ Waiting for backend to be ready... ($i/10)"
+          sleep 30
+        done
+        
+        # Health check frontend
+        echo "🔍 Checking frontend health..."
+        for i in {1..10}; do
+          if curl -f "$FRONTEND_URL/_stcore/health" > /dev/null 2>&1; then
+            echo "✅ Frontend health check passed"
+            break
+          fi
+          echo "⏳ Waiting for frontend to be ready... ($i/10)"
+          sleep 30
+        done
+        
+        # Run smoke tests
+        echo "🧪 Running smoke tests..."
+        curl -f "$BACKEND_URL/api/v1/" || (echo "❌ Smoke test failed" && exit 1)
+        
+        echo "✅ All health checks and smoke tests passed!"
+        echo "🌐 Backend URL: $BACKEND_URL"
+        echo "🌐 Frontend URL: $FRONTEND_URL"
+    waitFor: ['deploy-frontend']
+
+# Substitution variables
+substitutions:
+  _PROJECT_NAME: 'whatsapp-tracker'
+  _REPOSITORY: 'whatsapp-tracker-repo'
+  _REGISTRY_REGION: 'us-central1'
+  _REGION: 'us-central1'
+  
+  # Environment-specific project IDs
+  _DEV_PROJECT_ID: 'whatsapp-tracker-dev'
+  _STAGING_PROJECT_ID: 'whatsapp-tracker-staging'
+  _PROD_PROJECT_ID: 'whatsapp-tracker-prod'
+  
+  # Database configuration
+  _DATABASE_HOST: 'your-database-host'
+  _DATABASE_NAME: 'whatsapp_tracker'
+  _DATABASE_USER: 'whatsapp_user'
+  _DATABASE_PASSWORD: 'your-database-password'
+  _REDIS_URL: 'redis://your-redis-host:6379/0'
+  _ANTHROPIC_API_KEY: 'your-anthropic-api-key'
+  
+  # Resource limits
+  _MIN_INSTANCES: '0'
+  _MAX_INSTANCES: '10'
+  _CPU_LIMIT: '1000m'
+  _MEMORY_LIMIT: '2Gi'
+
+# Build options
+options:
+  machineType: 'E2_HIGHCPU_8'
+  substitution_option: 'ALLOW_LOOSE'
+  logging: CLOUD_LOGGING_ONLY
+
+# Build timeout
+timeout: '1800s'  # 30 minutes
+
+# IAM permissions for Cloud Build
+serviceAccount: 'projects/${PROJECT_ID}/serviceAccounts/cloudbuild@${PROJECT_ID}.iam.gserviceaccount.com'

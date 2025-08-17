@@ -1,0 +1,61 @@
+# docker-compose.test.yml - Testing environment
+version: '3.8'
+
+services:
+  # Backend for testing
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: whatsapp-tracker-test-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - WHATSAPP_TRACKER_ENV=test
+      - WHATSAPP_TRACKER_DATABASE_HOST=test-database
+      - WHATSAPP_TRACKER_DATABASE_PORT=5432
+      - WHATSAPP_TRACKER_DATABASE_NAME=whatsapp_tracker_test
+      - WHATSAPP_TRACKER_DATABASE_USER=test_user
+      - WHATSAPP_TRACKER_DATABASE_PASSWORD=test_pass
+      - WHATSAPP_TRACKER_REDIS_URL=redis://test-redis:6379/1
+      - WHATSAPP_TRACKER_LOG_LEVEL=DEBUG
+    volumes:
+      - .:/app
+      - ./test-results:/app/test-results
+    depends_on:
+      - test-database
+      - test-redis
+    networks:
+      - whatsapp-tracker-test-network
+
+  # Test Database
+  test-database:
+    image: postgres:15-alpine
+    container_name: whatsapp-tracker-test-database
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_DB=whatsapp_tracker_test
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_pass
+    volumes:
+      - ./database/init:/docker-entrypoint-initdb.d
+    networks:
+      - whatsapp-tracker-test-network
+    tmpfs:
+      - /var/lib/postgresql/data  # Use tmpfs for faster test database
+
+  # Test Redis
+  test-redis:
+    image: redis:7-alpine
+    container_name: whatsapp-tracker-test-redis
+    ports:
+      - "6380:6379"
+    networks:
+      - whatsapp-tracker-test-network
+    tmpfs:
+      - /data  # Use tmpfs for faster test cache
+
+networks:
+  whatsapp-tracker-test-network:
+    driver: bridge
